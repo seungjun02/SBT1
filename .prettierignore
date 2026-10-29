@@ -1,0 +1,9 @@
+node_modules/
+.next/
+out/
+coverage/
+src/generated_prisma/
+package-lock.json
+next-env.d.ts
+*.tsbuildinfo
+/README.md
