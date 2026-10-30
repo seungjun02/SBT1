@@ -45,6 +45,7 @@ let supabaseClient = null;
 let closetDataClient = null;
 let activeSession = null;
 let lastAccountLoadError = null;
+let signOutInProgress = false;
 let authMode = "login";
 let accountLoadPromise = null;
 let syncedUserId = "";
@@ -582,25 +583,35 @@ async function loadAuthenticatedUser(user) {
   finally { if (accountLoadPromise?.promise === task) accountLoadPromise = null; }
 }
 async function signOut() {
-  if (!supabaseClient) return;
-  clearTimeout(cloudSaveTimer);
-  const { error } = await supabaseClient.auth.signOut();
-  if (error) {
+  if (!supabaseClient || signOutInProgress) return;
+  signOutInProgress = true;
+  const buttons = document.querySelectorAll("[data-action='logout'], [data-auth-logout]");
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    clearTimeout(cloudSaveTimer);
+    const { error } = await supabaseClient.auth.signOut();
+    if (error) throw error;
+    activeUser = null;
+    activeSession = null;
+    lastAccountLoadError = null;
+    activeCloudUpdatedAt = "";
+    activeStorageKey = STORAGE_KEY;
+    syncedUserId = "";
+    authLoadVersion++;
+    clearPendingCloudSave();
+    clearClosetOutfitSelections();
+    state = structuredClone(defaultState);
+    closeModal();
+    document.getElementById("modal").innerHTML = "";
+    showAuthScreen("login", "안전하게 로그아웃했어요.");
+  } catch (error) {
     console.error("로그아웃에 실패했습니다.", error);
     notify("로그아웃하지 못했어요. 다시 시도해 주세요.");
-    return;
+    if (pendingCloudSave) cloudSaveTimer = setTimeout(flushPendingCloudSave, 0);
+  } finally {
+    signOutInProgress = false;
+    buttons.forEach(button => { button.disabled = false; });
   }
-  activeUser = null;
-  activeSession = null;
-  lastAccountLoadError = null;
-  activeCloudUpdatedAt = "";
-  activeStorageKey = STORAGE_KEY;
-  syncedUserId = "";
-  authLoadVersion++;
-  clearPendingCloudSave();
-  clearClosetOutfitSelections();
-  state = structuredClone(defaultState);
-  showAuthScreen("login", "안전하게 로그아웃했어요.");
 }
 async function initializeAuthentication() {
   const config = window.MOA_SUPABASE_CONFIG;
@@ -635,6 +646,8 @@ async function initializeAuthentication() {
       clearPendingCloudSave();
       clearClosetOutfitSelections();
       state = structuredClone(defaultState);
+      closeModal();
+      document.getElementById("modal").innerHTML = "";
       showAuthScreen("login");
     }
   });
@@ -1605,13 +1618,13 @@ function bindDynamicEvents() {
     if (outfit) showTryOnModal(outfit);
   }));
   document.querySelectorAll("[data-wear]").forEach(button => button.addEventListener("click", () => wearOutfit(button.dataset.wear)));
-  document.querySelectorAll("[data-action='upload']").forEach(button => button.addEventListener("click", openFilePicker));
+  document.querySelectorAll("[data-action='upload']").forEach(button => { button.onclick = button.closest("#closet-results") ? null : openFilePicker; });
   document.querySelectorAll("[data-remove-background]").forEach(button => button.addEventListener("click", () => removeExistingGarmentBackground(button)));
   document.querySelectorAll("[data-action='remove-all-backgrounds']").forEach(button => button.addEventListener("click", () => removeAllGarmentBackgrounds(button)));
   document.querySelectorAll("[data-action='weather']").forEach(button => button.addEventListener("click", fetchWeather));
-  document.querySelectorAll("[data-action='profile']").forEach(button => button.addEventListener("click", showProfileModal));
-  document.querySelectorAll("[data-action='logout']").forEach(button => button.addEventListener("click", signOut));
-  document.querySelectorAll("[data-action='retry-cloud-save']").forEach(button => button.addEventListener("click", retryPendingCloudSave));
+  document.querySelectorAll("[data-action='profile']").forEach(button => { button.onclick = showProfileModal; });
+  document.querySelectorAll("[data-action='logout']").forEach(button => { button.onclick = signOut; });
+  document.querySelectorAll("[data-action='retry-cloud-save']").forEach(button => { button.onclick = retryPendingCloudSave; });
   document.querySelectorAll("[data-action='recommend']").forEach(button => button.addEventListener("click", () => { activeView = "home"; document.querySelector(".section-heading")?.scrollIntoView({ behavior: "smooth" }); }));
   document.querySelectorAll("[data-action='refresh-recommendations']").forEach(button => button.addEventListener("click", () => {
     const recommendations = getRecommendations();
@@ -2074,11 +2087,13 @@ function showProfileModal() {
 function showModal() {
   const backdrop = document.getElementById("modal-backdrop");
   backdrop.hidden = false;
+  document.body.classList.add("modal-open");
   backdrop.querySelectorAll("[data-close]").forEach(button => button.addEventListener("click", closeModal));
 }
 function closeModal() {
   document.getElementById("modal-backdrop").hidden = true;
   document.getElementById("modal").classList.remove("try-on-modal");
+  document.body.classList.remove("modal-open");
 }
 async function updateWeatherAt(coordinates, quiet = false) {
   if (weatherRequestInProgress) return;
