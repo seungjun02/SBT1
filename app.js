@@ -71,6 +71,8 @@ let recommendationPoolSize = 0;
 let recommendationCacheInputKey = "";
 let recommendationResultCache = new Map();
 let closetPhotoObserver = null;
+let outfitPhotoResizeObserver = null;
+const observedOutfitFrames = new Set();
 let selectedClosetItemIds = new Set();
 let appliedClosetItemIds = new Set();
 let weatherCoordinates = null;
@@ -892,14 +894,27 @@ function render() {
   orientWidePhotos(container);
 }
 function orientWidePhotos(root) {
+  if (typeof ResizeObserver === "function") {
+    if (!outfitPhotoResizeObserver) {
+      outfitPhotoResizeObserver = new ResizeObserver(entries => {
+        entries.forEach(({ target }) => target.querySelectorAll("img[data-auto-portrait]").forEach(applyImageOrientation));
+      });
+    }
+    for (const frame of observedOutfitFrames) {
+      if (!frame.isConnected) {
+        outfitPhotoResizeObserver.unobserve(frame);
+        observedOutfitFrames.delete(frame);
+      }
+    }
+    root.querySelectorAll(".outfit-art").forEach(frame => {
+      if (!observedOutfitFrames.has(frame)) {
+        observedOutfitFrames.add(frame);
+        outfitPhotoResizeObserver.observe(frame);
+      }
+    });
+  }
   root.querySelectorAll("img[data-auto-portrait]").forEach(image => {
-    const applyOrientation = () => {
-      const savedRotation = image.dataset.photoRotation;
-      const rotation = savedRotation === "auto"
-        ? (image.naturalWidth > image.naturalHeight ? 90 : 0)
-        : Number(savedRotation);
-      image.style.transform = rotation ? `rotate(${rotation}deg)` : "none";
-    };
+    const applyOrientation = () => applyImageOrientation(image);
     if (image.dataset.closetPhoto) {
       if (!("IntersectionObserver" in window)) {
         const item = state.items.find(entry => entry.id === image.dataset.closetPhoto);
@@ -934,7 +949,20 @@ function applyImageOrientation(image) {
   const rotation = savedRotation === "auto"
     ? (image.naturalWidth > image.naturalHeight ? 90 : 0)
     : Number(savedRotation);
-  image.style.transform = rotation ? `rotate(${rotation}deg)` : "none";
+  const frame = image.parentElement;
+  if (frame?.classList.contains("outfit-piece")) {
+    const width = frame.clientWidth;
+    const height = frame.clientHeight;
+    if (!width || !height) return;
+    // Swap the image's box before a quarter turn so its rotated bounds stay
+    // inside the tile. object-fit: contain preserves the entire garment.
+    const quarterTurn = Math.abs(rotation % 180) === 90;
+    image.style.width = `${quarterTurn ? height : width}px`;
+    image.style.height = `${quarterTurn ? width : height}px`;
+    image.style.transform = `translate(-50%, -50%) rotate(${rotation}deg)`;
+  } else {
+    image.style.transform = rotation ? `rotate(${rotation}deg)` : "none";
+  }
 }
 function outfitCards(savedOnly = false) {
   const outfits = getRecommendations();
@@ -2134,4 +2162,9 @@ document.getElementById("photo-input").addEventListener("change", event => { han
 document.getElementById("modal-backdrop").addEventListener("click", event => { if (event.target.id === "modal-backdrop") closeModal(); });
 document.addEventListener("keydown", event => { if (event.key === "Escape") closeModal(); });
 window.addEventListener("online", retryPendingCloudSave);
+window.addEventListener("resize", () => {
+  if (typeof ResizeObserver !== "function") {
+    document.querySelectorAll(".outfit-piece img[data-auto-portrait]").forEach(applyImageOrientation);
+  }
+});
 initializeAuthentication();
