@@ -396,7 +396,7 @@ function showAuthScreen(mode = "login", message = "", busy = false, options = {}
   screen.innerHTML = `<section class="auth-card">
     <a class="brand auth-brand" href="#" aria-label="모아 홈"><span class="brand-mark">m</span><span>moa<span class="brand-dot">.</span></span></a>
     <span class="eyebrow">YOUR PRIVATE WARDROBE</span>
-    <h1>${isSignup ? "나만의 옷장을 시작해요" : "다시 만나요"}</h1>
+    <h1>${isSignup ? "나만의 옷장을 시작해요" : "반가워요, 오늘은 뭐 입을까요?"}</h1>
     <p class="auth-intro">${isSignup ? "이메일로 가입하고 나만의 옷장을 안전하게 보관하세요." : "로그인하면 나만의 옷장과 코디를 확인할 수 있어요."}</p>
     ${message ? `<p class="auth-message" role="status">${escapeHtml(message)}${canResendConfirmation ? `<br><button type="button" class="subtle-link" data-auth-resend>인증 메일 다시 보내기</button>` : ""}</p>` : ""}
     ${!configured ? `<p class="auth-setup-note"><strong>Supabase 설정이 필요합니다.</strong><br>프로젝트 URL과 공개 anon 키를 <code>supabase-config.js</code>에 입력하고, <code>supabase-schema.sql</code>을 Supabase SQL Editor에서 실행해 주세요. 비밀번호나 service_role 키는 코드에 넣지 마세요.</p>` : ""}
