@@ -8,6 +8,7 @@
             "type": "editor-browser",
             "request": "launch",
             "name": "localhost에 대해 통합 브라우저 시작",
+            "preLaunchTask": "Start local website",
             "url": "http://localhost:8080",
             "webRoot": "${workspaceFolder}"
         }
