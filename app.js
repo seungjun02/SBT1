@@ -42,6 +42,9 @@ let state = structuredClone(defaultState);
 let activeUser = null;
 let activeStorageKey = STORAGE_KEY;
 let supabaseClient = null;
+let closetDataClient = null;
+let activeSession = null;
+let lastAccountLoadError = null;
 let authMode = "login";
 let accountLoadPromise = null;
 let syncedUserId = "";
@@ -299,9 +302,50 @@ function scheduleCloudReadRetry(user) {
     if (activeUser?.id === user.id && syncedUserId !== user.id) loadAuthenticatedUser(user);
   }, delay);
 }
+function getClosetDataClient(userId) {
+  if (!closetDataClient || !activeSession?.access_token || activeSession.user?.id !== userId) {
+    throw Object.assign(new Error("로그인 연결이 만료되었어요. 다시 로그인해 주세요."), { status: 401 });
+  }
+  return closetDataClient;
+}
+function isTemporaryClosetError(error) {
+  const status = Number(error?.status || 0);
+  if (status) return status === 408 || status === 429 || status >= 500;
+  return error?.code === "CLOSET_READ_TIMEOUT" || /fetch|network|offline|timeout|timed out|abort|연결|시간.*초과/i.test(error?.message || "");
+}
+async function readClosetRecord(userId, columns, loadVersion) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (activeUser?.id !== userId || authLoadVersion !== loadVersion) throw new Error("계정 전환으로 조회를 취소했습니다.");
+    const controller = new AbortController();
+    let timeout;
+    try {
+      const result = await Promise.race([
+        getClosetDataClient(userId).from("user_closets").select(columns).eq("user_id", userId).maybeSingle().retry(false).abortSignal(controller.signal),
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(Object.assign(new Error("옷장 서버 응답 시간이 초과되었습니다."), { code: "CLOSET_READ_TIMEOUT" }));
+            controller.abort();
+          }, columns === "updated_at" ? 15000 : 45000);
+        })
+      ]);
+      if (result.error) throw Object.assign(new Error(result.error.message || "옷장 연결에 실패했습니다."), result.error, { status: result.status });
+      return result;
+    } catch (error) {
+      clearTimeout(timeout);
+      if (attempt || !isTemporaryClosetError(error)) throw error;
+      lastAccountLoadError = { userId, message: error.message };
+      if (activeUser?.id !== userId || authLoadVersion !== loadVersion) throw error;
+      const status = document.getElementById("account-load-status");
+      if (status) status.textContent = "연결이 지연되어 한 번 더 시도하고 있어요… (2/2)";
+      await new Promise(resolve => setTimeout(resolve, 750));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
 async function saveClosetToCloud(userId, snapshot) {
   const controller = new AbortController();
-  const request = supabaseClient
+  const request = getClosetDataClient(userId)
     .from("user_closets")
     .upsert({ user_id: userId, state: snapshot, updated_at: snapshot.updatedAt || new Date().toISOString() }, { onConflict: "user_id" })
     .abortSignal(controller.signal);
@@ -393,11 +437,15 @@ function showAuthScreen(mode = "login", message = "", busy = false, options = {}
         const name = String(formData.get("name") || "").trim();
         const { data, error } = await supabaseClient.auth.signUp({ email, password, options: { data: { name } } });
         if (error) throw error;
-        if (data.session && data.user) await loadAuthenticatedUser(data.user);
+        if (data.session && data.user) {
+          activeSession = data.session;
+          await loadAuthenticatedUser(data.user);
+        }
         else showAuthScreen("login", "가입 신청을 완료했어요. 이메일 인증을 마친 뒤 로그인해 주세요.");
       } else {
         const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
         if (error) throw error;
+        activeSession = data.session;
         await loadAuthenticatedUser(data.user);
       }
     } catch (error) {
@@ -417,7 +465,9 @@ function showAuthScreen(mode = "login", message = "", busy = false, options = {}
 function showAccountLoadError(error) {
   console.error("계정 옷장을 불러오지 못했습니다.", error);
   const screen = document.getElementById("auth-screen");
-  screen.innerHTML = `<section class="auth-card"><a class="brand auth-brand" href="#" aria-label="모아 홈"><span class="brand-mark">m</span><span>moa<span class="brand-dot">.</span></span></a><span class="eyebrow">PRIVATE WARDROBE</span><h1>옷장을 불러오지 못했어요</h1><p class="auth-message" role="alert">${escapeHtml(error.message || "Supabase 설정과 테이블 권한을 확인해 주세요.")}</p><p class="auth-setup-note">Supabase 프로젝트 URL·anon 키와 RLS 정책을 확인해 주세요. 계정 데이터는 분리 상태를 확인할 수 없으면 화면에 표시하지 않습니다.</p><div class="auth-actions"><button type="button" class="primary-button" data-auth-retry>다시 시도</button><button type="button" class="secondary-button" data-auth-logout>로그아웃</button></div></section>`;
+  screen.hidden = false;
+  document.getElementById("app-shell").hidden = true;
+  screen.innerHTML = `<section class="auth-card"><a class="brand auth-brand" href="#" aria-label="모아 홈"><span class="brand-mark">m</span><span>moa<span class="brand-dot">.</span></span></a><span class="eyebrow">PRIVATE WARDROBE</span><h1>옷장을 불러오지 못했어요</h1><p class="auth-message" role="alert">${escapeHtml(error.message || "옷장 서버에 연결하지 못했어요.")}${error.code ? `<br>오류 코드: ${escapeHtml(error.code)}` : ""}</p><p class="auth-intro">저장된 옷장은 변경하지 않았어요. 연결을 확인한 뒤 다시 시도하거나 다시 로그인해 주세요.</p><div class="auth-actions"><button type="button" class="primary-button" data-auth-retry>다시 시도</button><button type="button" class="secondary-button" data-auth-logout>로그아웃</button></div></section>`;
   screen.querySelector("[data-auth-retry]").addEventListener("click", () => loadAuthenticatedUser(activeUser));
   screen.querySelector("[data-auth-logout]").addEventListener("click", signOut);
 }
@@ -433,6 +483,7 @@ async function loadAuthenticatedUser(user) {
     clearPendingCloudSave();
     clearClosetOutfitSelections();
     activeCloudUpdatedAt = "";
+    lastAccountLoadError = null;
     document.getElementById("app-shell").hidden = true;
     document.getElementById("auth-screen").hidden = false;
   }
@@ -452,37 +503,23 @@ async function loadAuthenticatedUser(user) {
       setCloudSaveStatus("pending");
     } else {
       document.getElementById("auth-screen").hidden = false;
-      document.getElementById("auth-screen").innerHTML = `<section class="auth-card"><span class="brand-mark">m</span><h1>나만의 옷장을 불러오는 중…</h1><p class="auth-intro">계정 데이터를 안전하게 확인하고 있어요.</p></section>`;
+      const previousError = lastAccountLoadError?.userId === user.id ? lastAccountLoadError.message : "";
+      document.getElementById("auth-screen").innerHTML = `<section class="auth-card"><span class="brand-mark">m</span><h1>나만의 옷장을 불러오는 중…</h1><p class="auth-intro" id="account-load-status" role="status">계정 데이터를 확인하고 있어요.</p>${previousError ? `<p class="auth-message">이전 연결 오류: ${escapeHtml(previousError)}</p>` : ""}<button type="button" class="secondary-button" data-auth-logout>로그아웃</button></section>`;
+      document.getElementById("auth-screen").querySelector("[data-auth-logout]").addEventListener("click", signOut);
     }
     try {
-      const controller = new AbortController();
       let cloudUnchanged = false;
       const request = (async () => {
         if (cachedState && activeCloudUpdatedAt) {
-          const metadata = await supabaseClient.from("user_closets").select("updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
-          if (metadata.error) return metadata;
+          const metadata = await readClosetRecord(user.id, "updated_at", loadVersion);
           if (metadata.data && Date.parse(metadata.data.updated_at) === Date.parse(activeCloudUpdatedAt)) {
             cloudUnchanged = true;
             return { data: { state: cachedState, updated_at: metadata.data.updated_at }, error: null };
           }
         }
-        return supabaseClient.from("user_closets").select("state, updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
+        return readClosetRecord(user.id, "state, updated_at", loadVersion);
       })();
-      let timeout;
-      let result;
-      try {
-        result = await Promise.race([
-          request,
-          new Promise((_, reject) => {
-            timeout = setTimeout(() => {
-              controller.abort();
-              reject(new Error("클라우드 옷장 확인 시간이 45초를 초과했습니다."));
-            }, 45000);
-          })
-        ]);
-      } finally {
-        clearTimeout(timeout);
-      }
+      const result = await request;
       const { data, error } = result;
       if (error) throw error;
       if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
@@ -512,16 +549,18 @@ async function loadAuthenticatedUser(user) {
       activeCloudUpdatedAt = data?.updated_at || "";
       // Cache large photos without blocking the first render on a disk write.
       void writeAccountCache(user.id, createStorageSnapshot(), activeCloudUpdatedAt);
-      syncedUserId = user.id;
       document.getElementById("auth-screen").hidden = true;
       document.getElementById("app-shell").hidden = false;
       render();
+      syncedUserId = user.id;
+      lastAccountLoadError = null;
       clearTimeout(cloudReadRetryTimer);
       cloudReadRetryAttempt = 0;
       setCloudSaveStatus(pendingCloudSave ? "pending" : "saved");
       reanalyzeStoredColors();
     } catch (error) {
       if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
+      lastAccountLoadError = { userId: user.id, message: error.message };
       if (cachedState) {
         state = (await readAccountCache(user.id))?.state || cachedState;
         if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
@@ -537,8 +576,8 @@ async function loadAuthenticatedUser(user) {
     }
   })();
   accountLoadPromise = { userId: user.id, promise: task };
-  await task;
-  if (accountLoadPromise?.promise === task) accountLoadPromise = null;
+  try { await task; }
+  finally { if (accountLoadPromise?.promise === task) accountLoadPromise = null; }
 }
 async function signOut() {
   if (!supabaseClient) return;
@@ -550,6 +589,8 @@ async function signOut() {
     return;
   }
   activeUser = null;
+  activeSession = null;
+  lastAccountLoadError = null;
   activeCloudUpdatedAt = "";
   activeStorageKey = STORAGE_KEY;
   syncedUserId = "";
@@ -566,11 +607,25 @@ async function initializeAuthentication() {
     return;
   }
   supabaseClient = window.supabase.createClient(config.url, config.anonKey);
+  // Use the session already delivered by Auth instead of reacquiring its lock
+  // for every database request. Auth remains responsible for token refresh.
+  closetDataClient = window.supabase.createClient(config.url, config.anonKey, {
+    accessToken: async () => activeSession?.access_token || null
+  });
   showAuthScreen("login");
   supabaseClient.auth.onAuthStateChange((event, session) => {
-    if (session?.user) setTimeout(() => loadAuthenticatedUser(session.user), 0);
+    if (session?.user) {
+      activeSession = session;
+      const shouldLoad = activeUser?.id !== session.user.id || !lastAccountLoadError || event === "TOKEN_REFRESHED";
+      if (shouldLoad) setTimeout(() => {
+        if (activeSession?.user?.id === session.user.id
+          && (activeUser?.id !== session.user.id || !lastAccountLoadError || event === "TOKEN_REFRESHED")) loadAuthenticatedUser(session.user);
+      }, 0);
+    }
     else if (event === "SIGNED_OUT") {
       activeUser = null;
+      activeSession = null;
+      lastAccountLoadError = null;
       activeCloudUpdatedAt = "";
       activeStorageKey = STORAGE_KEY;
       syncedUserId = "";
@@ -587,7 +642,10 @@ async function initializeAuthentication() {
     showAuthScreen("login", "로그인 상태를 확인하지 못했습니다. 새로고침해 다시 시도해 주세요.");
     return;
   }
-  if (data.session?.user) await loadAuthenticatedUser(data.session.user);
+  if (data.session?.user) {
+    activeSession = data.session;
+    await loadAuthenticatedUser(data.session.user);
+  }
 }
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
