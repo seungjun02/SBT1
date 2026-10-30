@@ -46,6 +46,8 @@ let authMode = "login";
 let accountLoadPromise = null;
 let syncedUserId = "";
 let authLoadVersion = 0;
+let accountCacheDatabasePromise = null;
+let activeCloudUpdatedAt = "";
 let cloudSaveTimer = null;
 let cloudSaveRetryTimer = null;
 let cloudReadRetryTimer = null;
@@ -127,11 +129,84 @@ function createStorageSnapshot() {
   }));
   return snapshot;
 }
+function openAccountCacheDatabase() {
+  if (!accountCacheDatabasePromise) {
+    accountCacheDatabasePromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open("moa-account-cache", 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("closets");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("옷장 캐시를 열 수 없습니다."));
+    }).catch(error => {
+      accountCacheDatabasePromise = null;
+      throw error;
+    });
+  }
+  return accountCacheDatabasePromise;
+}
+async function readAccountCache(userId) {
+  let record = null;
+  try {
+    const database = await openAccountCacheDatabase();
+    record = await new Promise((resolve, reject) => {
+      const transaction = database.transaction("closets", "readonly");
+      const request = transaction.objectStore("closets").get(userId);
+      transaction.oncomplete = () => resolve(request.result || null);
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+    if (record) record.state = mergeStoredState(record.state);
+  } catch (error) {
+    record = null;
+    console.warn("브라우저 옷장 캐시를 읽지 못했습니다.", error);
+  }
+  // Keep existing caches readable, including a newer localStorage fallback.
+  try {
+    const key = `${ACCOUNT_STORAGE_PREFIX}${userId}`;
+    if (localStorage.getItem(key) !== null) {
+      const legacyState = loadState(key);
+      if (!record || Date.parse(legacyState.updatedAt || "") > Date.parse(record.state.updatedAt || "")) {
+        record = { state: legacyState, cloudUpdatedAt: "" };
+      }
+    }
+  } catch (error) {
+    console.warn("기존 옷장 캐시를 읽지 못했습니다.", error);
+  }
+  return record;
+}
+async function writeAccountCache(userId, snapshot, cloudUpdatedAt = "") {
+  try {
+    const database = await openAccountCacheDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction("closets", "readwrite");
+      transaction.objectStore("closets").put({ state: snapshot, cloudUpdatedAt }, userId);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error);
+    });
+    return true;
+  } catch (error) {
+    try {
+      localStorage.setItem(`${ACCOUNT_STORAGE_PREFIX}${userId}`, JSON.stringify(snapshot));
+      return true;
+    } catch (fallbackError) {
+      console.error("기기에 옷장을 저장하지 못했습니다.", error, fallbackError);
+      return false;
+    }
+  }
+}
 function persist() {
   state.updatedAt = new Date().toISOString();
   const snapshot = createStorageSnapshot();
-  try { localStorage.setItem(activeStorageKey, JSON.stringify(snapshot)); }
-  catch (error) { notify("이 기기에 옷장을 저장하지 못했어요."); console.error("옷장 로컬 저장 실패", error); }
+  if (activeUser) {
+    const userId = activeUser.id;
+    writeAccountCache(userId, snapshot, activeCloudUpdatedAt).then(saved => {
+      if (!saved && activeUser?.id === userId) notify("이 기기에 옷장을 저장하지 못했어요.");
+    });
+  } else {
+    try { localStorage.setItem(activeStorageKey, JSON.stringify(snapshot)); }
+    catch (error) { notify("이 기기에 옷장을 저장하지 못했어요."); console.error("옷장 로컬 저장 실패", error); }
+  }
   if (!activeUser || !supabaseClient) return;
   if (syncedUserId !== activeUser.id) {
     setCloudSaveStatus("pending");
@@ -247,6 +322,11 @@ async function saveClosetToCloud(userId, snapshot) {
   }
   const { error } = result;
   if (error) throw error;
+  if (activeUser?.id === userId) {
+    activeCloudUpdatedAt = snapshot.updatedAt;
+    // Do not replace edits made while this upload was in flight.
+    await writeAccountCache(userId, createStorageSnapshot(), activeCloudUpdatedAt);
+  }
 }
 function clearPendingCloudSave() {
   clearTimeout(cloudSaveTimer);
@@ -349,19 +429,21 @@ async function loadAuthenticatedUser(user) {
     return;
   }
   if (accountLoadPromise?.userId === user.id) return accountLoadPromise.promise;
-  if (activeUser && activeUser.id !== user.id) clearClosetOutfitSelections();
+  if (activeUser?.id !== user.id) {
+    clearPendingCloudSave();
+    clearClosetOutfitSelections();
+    activeCloudUpdatedAt = "";
+    document.getElementById("app-shell").hidden = true;
+    document.getElementById("auth-screen").hidden = false;
+  }
   activeUser = user;
   const loadVersion = ++authLoadVersion;
   const task = (async () => {
     activeStorageKey = `${ACCOUNT_STORAGE_PREFIX}${user.id}`;
-    let hasAccountCache = false;
-    let cachedState = null;
-    try {
-      hasAccountCache = localStorage.getItem(activeStorageKey) !== null;
-      cachedState = hasAccountCache ? loadState(activeStorageKey) : null;
-    } catch (cacheError) {
-      console.error("계정 옷장 로컬 캐시를 읽지 못했습니다. 클라우드에서 복구를 시도합니다.", cacheError);
-    }
+    const cachedRecord = await readAccountCache(user.id);
+    if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
+    let cachedState = cachedRecord?.state || null;
+    activeCloudUpdatedAt = cachedRecord?.cloudUpdatedAt || "";
     if (cachedState) {
       state = cachedState;
       document.getElementById("auth-screen").hidden = true;
@@ -374,7 +456,18 @@ async function loadAuthenticatedUser(user) {
     }
     try {
       const controller = new AbortController();
-      const request = supabaseClient.from("user_closets").select("state, updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
+      let cloudUnchanged = false;
+      const request = (async () => {
+        if (cachedState && activeCloudUpdatedAt) {
+          const metadata = await supabaseClient.from("user_closets").select("updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
+          if (metadata.error) return metadata;
+          if (metadata.data && Date.parse(metadata.data.updated_at) === Date.parse(activeCloudUpdatedAt)) {
+            cloudUnchanged = true;
+            return { data: { state: cachedState, updated_at: metadata.data.updated_at }, error: null };
+          }
+        }
+        return supabaseClient.from("user_closets").select("state, updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
+      })();
       let timeout;
       let result;
       try {
@@ -396,9 +489,10 @@ async function loadAuthenticatedUser(user) {
       if (data) {
         if (!data.state || !Array.isArray(data.state.items)) throw new Error("저장된 옷장 데이터 형식이 올바르지 않습니다.");
         const cloudState = mergeStoredState(data.state);
-        hasAccountCache = localStorage.getItem(activeStorageKey) !== null;
-        cachedState = hasAccountCache ? loadState(activeStorageKey) : null;
-        if (shouldPreferCachedClosetState(cachedState, cloudState, data.updated_at)) {
+        cachedState = (await readAccountCache(user.id))?.state || cachedState;
+        if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
+        if (shouldPreferCachedClosetState(cachedState, cloudState, data.updated_at)
+          || (cloudUnchanged && Date.parse(cachedState?.updatedAt || "") > Date.parse(data.updated_at))) {
           state = cachedState;
           if (!Number.isFinite(Date.parse(state.updatedAt || ""))) state.updatedAt = new Date().toISOString();
           scheduleCloudSave(user.id, createStorageSnapshot(), 0);
@@ -406,8 +500,8 @@ async function loadAuthenticatedUser(user) {
           state = cloudState;
         }
       } else {
-        hasAccountCache = localStorage.getItem(activeStorageKey) !== null;
-        cachedState = hasAccountCache ? loadState(activeStorageKey) : null;
+        cachedState = (await readAccountCache(user.id))?.state || cachedState;
+        if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
         const hasLegacyData = localStorage.getItem(STORAGE_KEY) !== null;
         if (cachedState) state = cachedState;
         else if (hasLegacyData && window.confirm("이 브라우저에 남아 있는 기존 옷장을 이 계정으로 옮길까요? 취소하면 이 계정에 새 옷장을 만들고 기존 브라우저 데이터는 그대로 둡니다.")) state = loadState(STORAGE_KEY);
@@ -415,8 +509,9 @@ async function loadAuthenticatedUser(user) {
         if (!Number.isFinite(Date.parse(state.updatedAt || ""))) state.updatedAt = new Date().toISOString();
         scheduleCloudSave(user.id, createStorageSnapshot(), 0);
       }
-      try { localStorage.setItem(activeStorageKey, JSON.stringify(createStorageSnapshot())); }
-      catch (cacheError) { console.error("계정 옷장 로컬 캐시 저장에 실패했습니다.", cacheError); }
+      activeCloudUpdatedAt = data?.updated_at || "";
+      // Cache large photos without blocking the first render on a disk write.
+      void writeAccountCache(user.id, createStorageSnapshot(), activeCloudUpdatedAt);
       syncedUserId = user.id;
       document.getElementById("auth-screen").hidden = true;
       document.getElementById("app-shell").hidden = false;
@@ -428,7 +523,8 @@ async function loadAuthenticatedUser(user) {
     } catch (error) {
       if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
       if (cachedState) {
-        state = loadState(activeStorageKey);
+        state = (await readAccountCache(user.id))?.state || cachedState;
+        if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
         document.getElementById("auth-screen").hidden = true;
         document.getElementById("app-shell").hidden = false;
         render();
@@ -454,6 +550,7 @@ async function signOut() {
     return;
   }
   activeUser = null;
+  activeCloudUpdatedAt = "";
   activeStorageKey = STORAGE_KEY;
   syncedUserId = "";
   authLoadVersion++;
@@ -474,6 +571,7 @@ async function initializeAuthentication() {
     if (session?.user) setTimeout(() => loadAuthenticatedUser(session.user), 0);
     else if (event === "SIGNED_OUT") {
       activeUser = null;
+      activeCloudUpdatedAt = "";
       activeStorageKey = STORAGE_KEY;
       syncedUserId = "";
       authLoadVersion++;
