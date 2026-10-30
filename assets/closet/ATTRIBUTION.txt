@@ -1,0 +1,48 @@
+Wikimedia Commons sample photos:
+
+hoodie-white.jpg — "Witte hoodie met witte letter “S” erop, objectnr 86986-2(1).JPG"
+Museum Rotterdam, CC BY-SA 3.0
+https://creativecommons.org/licenses/by-sa/3.0/
+https://commons.wikimedia.org/wiki/File:Witte_hoodie_met_witte_letter_%E2%80%9CS%E2%80%9D_erop,_objectnr_86986-2(1).JPG
+
+sweater-checkered.jpg — "Checkered Sweater H&M.jpg"
+Kauey, CC BY-SA 4.0
+https://creativecommons.org/licenses/by-sa/4.0/
+https://commons.wikimedia.org/wiki/File:Checkered_Sweater_H%26M.jpg
+
+skirt-blue.jpg — "Skirt, woman's (AM 1999.19.4-1).jpg"
+Nae-Peer; Napier Woollen Mills, CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/
+https://commons.wikimedia.org/wiki/File:Skirt,_woman's_(AM_1999.19.4-1).jpg
+
+boots-black.jpg — "Black high-heeled boots in synthetic leather 1.jpg"
+W.carter, CC BY-SA 4.0
+https://creativecommons.org/licenses/by-sa/4.0/
+https://commons.wikimedia.org/wiki/File:Black_high-heeled_boots_in_synthetic_leather_1.jpg
+
+blouse-white.jpg — "Woman's blouse (AM 2008.21.8-2).jpg"
+Author unknown, CC BY 4.0
+https://creativecommons.org/licenses/by/4.0/
+https://commons.wikimedia.org/wiki/File:Woman's_blouse_(AM_2008.21.8-2).jpg
+
+Other sample photos are from Unsplash and are used under the Unsplash License:
+https://unsplash.com/license
+
+green-aran-sweater.jpg — "Green Aran Sweater.JPG"
+Smee, public domain
+https://commons.wikimedia.org/wiki/File:Green_Aran_Sweater.JPG
+
+yellow-striped-sweater.jpg — "H&M Striped Sweater - yellow and gold - 2006.jpg"
+m01229, CC BY 2.0
+https://creativecommons.org/licenses/by/2.0/
+https://commons.wikimedia.org/wiki/File:H%26M_Striped_Sweater_-_yellow_and_gold_-_2006.jpg
+
+purple-blouse.jpg — "Purple Blouse, Sequined Seafoam Mini Skirt, Cateye Glasses and Two-toned Flats (19251945006).jpg"
+Panam2014, CC BY-SA 2.0
+https://creativecommons.org/licenses/by-sa/2.0/
+https://commons.wikimedia.org/wiki/File:Purple_Blouse,_Sequined_Seafoam_Mini_Skirt,_Cateye_Glasses_and_Two-toned_Flats_(19251945006).jpg
+
+beige-lamb-coat.jpg — "Beige Borregos lamb coat (1).jpg"
+Kürschner, CC0 1.0
+https://creativecommons.org/publicdomain/zero/1.0/
+https://commons.wikimedia.org/wiki/File:Beige_Borregos_lamb_coat_(1).jpg
