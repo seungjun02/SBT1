@@ -118,9 +118,18 @@ function loadState(key = STORAGE_KEY) {
     throw new Error(error instanceof Error ? `이 브라우저에 저장된 옷장 데이터를 읽지 못했습니다: ${error.message}` : "이 브라우저에 저장된 옷장 데이터를 읽지 못했습니다.");
   }
 }
+function createStorageSnapshot() {
+  const snapshot = structuredClone(state);
+  const currentItemIds = new Set(snapshot.items.map(item => item.id));
+  snapshot.saved = snapshot.saved.map(outfit => ({
+    ...outfit,
+    picks: outfit.picks.map(pick => currentItemIds.has(pick.id) ? { id: pick.id } : pick)
+  }));
+  return snapshot;
+}
 function persist() {
   state.updatedAt = new Date().toISOString();
-  const snapshot = structuredClone(state);
+  const snapshot = createStorageSnapshot();
   try { localStorage.setItem(activeStorageKey, JSON.stringify(snapshot)); }
   catch (error) { notify("이 기기에 옷장을 저장하지 못했어요."); console.error("옷장 로컬 저장 실패", error); }
   if (!activeUser || !supabaseClient) return;
@@ -146,7 +155,7 @@ function retryPendingCloudSave() {
     loadAuthenticatedUser(activeUser);
     return;
   }
-  if (!pendingCloudSave) scheduleCloudSave(activeUser.id, structuredClone(state), 0);
+  if (!pendingCloudSave) scheduleCloudSave(activeUser.id, createStorageSnapshot(), 0);
   clearTimeout(cloudSaveTimer);
   clearTimeout(cloudSaveRetryTimer);
   cloudSaveTimer = setTimeout(flushPendingCloudSave, 0);
@@ -216,16 +225,26 @@ function scheduleCloudReadRetry(user) {
   }, delay);
 }
 async function saveClosetToCloud(userId, snapshot) {
+  const controller = new AbortController();
   const request = supabaseClient
     .from("user_closets")
-    .upsert({ user_id: userId, state: snapshot, updated_at: snapshot.updatedAt || new Date().toISOString() }, { onConflict: "user_id" });
+    .upsert({ user_id: userId, state: snapshot, updated_at: snapshot.updatedAt || new Date().toISOString() }, { onConflict: "user_id" })
+    .abortSignal(controller.signal);
   let timeout;
-  const result = await Promise.race([
-    request,
-    new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error("클라우드 저장 응답 시간이 초과됐습니다.")), 15000);
-    })
-  ]).finally(() => clearTimeout(timeout));
+  let result;
+  try {
+    result = await Promise.race([
+      request,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          reject(new Error("클라우드 저장 응답 시간이 45초를 초과했습니다."));
+        }, 45000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
   const { error } = result;
   if (error) throw error;
 }
@@ -354,14 +373,24 @@ async function loadAuthenticatedUser(user) {
       document.getElementById("auth-screen").innerHTML = `<section class="auth-card"><span class="brand-mark">m</span><h1>나만의 옷장을 불러오는 중…</h1><p class="auth-intro">계정 데이터를 안전하게 확인하고 있어요.</p></section>`;
     }
     try {
-      const request = supabaseClient.from("user_closets").select("state, updated_at").eq("user_id", user.id).maybeSingle();
+      const controller = new AbortController();
+      const request = supabaseClient.from("user_closets").select("state, updated_at").eq("user_id", user.id).maybeSingle().abortSignal(controller.signal);
       let timeout;
-      const { data, error } = await Promise.race([
-        request,
-        new Promise((_, reject) => {
-          timeout = setTimeout(() => reject(new Error("클라우드 옷장 확인 시간이 초과됐습니다.")), 15000);
-        })
-      ]).finally(() => clearTimeout(timeout));
+      let result;
+      try {
+        result = await Promise.race([
+          request,
+          new Promise((_, reject) => {
+            timeout = setTimeout(() => {
+              controller.abort();
+              reject(new Error("클라우드 옷장 확인 시간이 45초를 초과했습니다."));
+            }, 45000);
+          })
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+      const { data, error } = result;
       if (error) throw error;
       if (activeUser?.id !== user.id || authLoadVersion !== loadVersion) return;
       if (data) {
@@ -372,7 +401,7 @@ async function loadAuthenticatedUser(user) {
         if (shouldPreferCachedClosetState(cachedState, cloudState, data.updated_at)) {
           state = cachedState;
           if (!Number.isFinite(Date.parse(state.updatedAt || ""))) state.updatedAt = new Date().toISOString();
-          scheduleCloudSave(user.id, structuredClone(state), 0);
+          scheduleCloudSave(user.id, createStorageSnapshot(), 0);
         } else {
           state = cloudState;
         }
@@ -384,9 +413,9 @@ async function loadAuthenticatedUser(user) {
         else if (hasLegacyData && window.confirm("이 브라우저에 남아 있는 기존 옷장을 이 계정으로 옮길까요? 취소하면 이 계정에 새 옷장을 만들고 기존 브라우저 데이터는 그대로 둡니다.")) state = loadState(STORAGE_KEY);
         else state = structuredClone(defaultState);
         if (!Number.isFinite(Date.parse(state.updatedAt || ""))) state.updatedAt = new Date().toISOString();
-        scheduleCloudSave(user.id, structuredClone(state), 0);
+        scheduleCloudSave(user.id, createStorageSnapshot(), 0);
       }
-      try { localStorage.setItem(activeStorageKey, JSON.stringify(state)); }
+      try { localStorage.setItem(activeStorageKey, JSON.stringify(createStorageSnapshot())); }
       catch (cacheError) { console.error("계정 옷장 로컬 캐시 저장에 실패했습니다.", cacheError); }
       syncedUserId = user.id;
       document.getElementById("auth-screen").hidden = true;
@@ -589,13 +618,62 @@ function colorHarmonyScore(items) {
 function dateLabel(date = new Date()) {
   return new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "long", day: "numeric", weekday: "short" }).format(date);
 }
+function weatherDateKey(weather, date = new Date()) {
+  const timezone = weather?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+function hasCurrentRainForecast(weather) {
+  return weather?.rainForecastSource === "hourly_remaining_day"
+    && weather.rainForecastDate === weatherDateKey(weather);
+}
 function weatherLabel() {
   const value = state.weather;
   if (!value) return { temp: "오늘 날씨", description: "위치를 설정해 확인해 보세요", icon: "⛅", location: "위치 설정" };
   const code = value.code;
-  const icon = code === 0 ? "☀️" : code <= 3 ? "⛅" : code >= 51 && code <= 82 ? "🌧️" : code >= 71 ? "❄️" : "☁️";
+  const icon = code === 0 ? "☀️" : code <= 3 ? "⛅" : (code >= 71 && code <= 77) || (code >= 85 && code <= 86) ? "❄️" : code >= 51 && code <= 82 ? "🌧️" : "☁️";
   const updatedAt = value.updatedAt ? ` · ${new Date(value.updatedAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} 기준` : "";
-  return { temp: `${Math.round(value.temp)}°`, description: `${value.description} · 강수확률 ${value.rain}%${updatedAt}`, icon, location: value.location || "내 위치" };
+  const rainForecast = hasCurrentRainForecast(value) ? ` · 오늘 남은 시간 강수확률 ${Math.round(value.rain)}%` : "";
+  return { temp: `${Math.round(value.temp)}°`, description: `${value.description}${rainForecast}${updatedAt}`, icon, location: value.location || "내 위치" };
+}
+function weatherAdvice() {
+  const weather = state.weather;
+  if (!weather) return { kind: "unknown", title: "오늘 날씨를 확인해 보세요", message: "현재 기온과 날씨에 맞는 옷차림을 알려드릴게요.", detail: "위치를 설정하면 실시간 날씨를 확인할 수 있어요." };
+  const temp = Number.isFinite(weather.temp) ? weather.temp : null;
+  const windSpeed = Number.isFinite(weather.windSpeed) ? weather.windSpeed : null;
+  const code = Number(weather.code);
+  const rain = hasCurrentRainForecast(weather) && Number.isFinite(weather.rain) ? weather.rain : null;
+  const precipitation = Number(weather.precipitation);
+  const raining = (code >= 51 && code <= 67) || (code >= 80 && code <= 82) || precipitation > 0;
+  const rainExpected = raining || (rain !== null && rain >= 60);
+  const condition = `${weather.description || "날씨 확인"}${Number.isFinite(temp) ? ` · ${Math.round(temp)}°` : ""}`;
+  const windDetail = Number.isFinite(windSpeed) ? `바람 ${Math.round(windSpeed)}km/h` : "";
+  const rainDetail = rain !== null ? `오늘 남은 시간 강수확률 ${Math.round(rain)}%` : "";
+  const detail = [condition, rainDetail, windDetail].filter(Boolean).join(" · ");
+
+  if (rainExpected) {
+    return {
+      kind: "rain",
+      title: raining ? "비가 오니 우산을 챙겨요" : "비 소식이 있어요",
+      message: raining ? "우산과 함께 젖어도 괜찮은 신발이나 방수되는 겉옷을 준비해 보세요." : "외출할 때 우산을 챙기고, 젖어도 괜찮은 신발을 신어 보세요.",
+      detail
+    };
+  }
+  if (Number.isFinite(windSpeed) && windSpeed >= 25 && Number.isFinite(temp) && temp <= 18) {
+    return { kind: "wind", title: "바람이 강해 쌀쌀하게 느껴질 수 있어요", message: "체감온도가 낮아질 수 있으니 바람막이나 겉옷을 하나 챙겨 보세요.", detail };
+  }
+  if (Number.isFinite(temp) && temp <= 5) {
+    return { kind: "cold", title: "날씨가 추우니 겉옷을 하나 챙기는 게 어떠세요?", message: "코트나 패딩처럼 따뜻한 옷을 입고 목도리도 함께 준비해 보세요.", detail };
+  }
+  if (Number.isFinite(temp) && temp <= 14) {
+    return { kind: "cool", title: "쌀쌀한 날씨예요", message: "니트나 가벼운 재킷을 겹쳐 입으면 따뜻하게 보낼 수 있어요.", detail };
+  }
+  if (Number.isFinite(windSpeed) && windSpeed >= 25) {
+    return { kind: "wind", title: "바람이 많이 불어요", message: "가벼운 바람막이를 챙기면 바람을 막는 데 도움이 돼요.", detail };
+  }
+  if (Number.isFinite(temp) && temp >= 27) {
+    return { kind: "hot", title: "기온이 높으니 시원하게 입어 보세요", message: "통풍이 잘되는 얇은 옷과 가벼운 신발로 편안하게 준비해 보세요.", detail };
+  }
+  return { kind: "mild", title: "오늘은 가볍게 겹쳐 입기 좋아요", message: "현재 날씨에 맞춰 얇은 겉옷을 준비하면 실내외 온도 차에도 편안해요.", detail };
 }
 function temperatureOutfitGuidance(temp) {
   if (!Number.isFinite(temp)) return "날씨를 연결하면 현재 기온에 어울리는 옷을 추천해요.";
@@ -997,6 +1075,7 @@ function showTryOnModal(outfit) {
 }
 function renderHome() {
   const weather = weatherLabel();
+  const advice = weatherAdvice();
   const occasionButtons = ["일상", "학교", "데이트", "면접", "여행"].map(value => `<button class="choice-chip ${state.selectedOccasion === value ? "selected" : ""}" data-occasion="${value}">${value}</button>`).join("");
   const recommendations = getRecommendations().slice(0, 3);
   const eligibleItemCount = state.items.filter(isGarmentForProfile).length;
@@ -1011,11 +1090,12 @@ function renderHome() {
     ? `내 옷장에서 고른 ${appliedClosetItemIds.size}벌을 포함해 어울리는 조합을 골랐어요.`
     : `${genderLabel ? `${genderLabel} 및 공용 옷 중 ` : ""}${eligibleItemCount}벌 중에서 ${escapeHtml(state.selectedOccasion)}에 어울리는 조합을 골랐어요`;
   return `<div class="page">
-    <section class="welcome"><div><span class="eyebrow">TODAY, YOUR WAY</span><h1>오늘은 <em>무엇을 입을까요?</em></h1><p>내 옷장에서 찾은 오늘의 가장 좋은 조합을 확인해 보세요.</p></div>
-      <div class="weather-pill"><span class="weather-symbol">${weather.icon}</span><div class="weather-info"><strong>${escapeHtml(weather.temp)}</strong><small>${escapeHtml(weather.description)}</small></div><button class="weather-location" data-action="weather">${escapeHtml(weather.location)} ↗</button></div>
-    </section>
+    <section class="welcome"><div><span class="eyebrow">TODAY, YOUR WAY</span><h1>오늘은 <em>무엇을 입을까요?</em></h1><p>내 옷장에서 찾은 오늘의 가장 좋은 조합을 확인해 보세요.</p></div></section>
     <section class="hero-grid">
-      <div class="hero-card"><div class="hero-copy"><span class="hero-tag">TODAY'S STYLE NOTE</span><h2>익숙한 옷도<br>새로운 조합으로.</h2><p>오늘의 날씨와 내 취향을 담아<br>코디를 골라봤어요.</p><button class="primary-button" data-action="recommend">오늘의 코디 보기 <span>↗</span></button></div><div class="hero-visual" aria-hidden="true"><div class="hero-person"><i class="person-hair"></i><i class="person-head"></i><i class="person-neck"></i><i class="person-top"></i><i class="person-bottom"></i></div><span class="sparkle one">✳</span><span class="sparkle two">✳</span></div></div>
+      <section class="weather-hero-card weather-advice-${advice.kind}" aria-label="오늘의 날씨 안내">
+        <div class="weather-hero-copy"><span class="hero-tag">TODAY'S WEATHER</span><div class="weather-hero-reading"><span class="weather-hero-icon" aria-hidden="true">${weather.icon}</span><strong>${escapeHtml(weather.temp)}</strong></div><p class="weather-hero-detail">${escapeHtml(advice.detail)}</p><h2>${escapeHtml(advice.title)}</h2><p class="weather-hero-message">${escapeHtml(advice.message)}</p><button class="weather-refresh-button" data-action="weather">${state.weather ? "날씨 업데이트 ↗" : "날씨 확인하기 ↗"}</button></div>
+        <div class="weather-hero-decoration" aria-hidden="true"><span>${weather.icon}</span><i></i><i></i></div>
+      </section>
       <div class="upload-card"><div class="upload-top"><div><h3>새 옷을 옷장에 담아보세요</h3><p>사진의 배경은 기기에서 제거하고, 파일명과 대표 색상으로 이름을 자동 생성해요.</p></div></div><div class="upload-drop" data-action="upload"><div><span class="upload-cloud">↑</span><strong>사진을 끌어오거나 클릭하기</strong><small>JPG, PNG · 첫 사용에는 AI 모델을 다운로드해요</small></div></div></div>
     </section>
     <section class="section-heading"><div><h2>${recommendationHeading}</h2><p>${recommendationDescription}</p></div><button class="subtle-link" data-action="refresh-recommendations">추천 다시 보기 <span>↗</span></button></section>
@@ -1704,7 +1784,7 @@ async function removeAllGarmentBackgrounds(button) {
 function persistLocalClosetSnapshot() {
   state.updatedAt = new Date().toISOString();
   try {
-    localStorage.setItem(activeStorageKey, JSON.stringify(state));
+    localStorage.setItem(activeStorageKey, JSON.stringify(createStorageSnapshot()));
   } catch (error) {
     notify("기기에 옷장 사진을 저장하지 못했어요.");
     console.error("누끼 제거 사진을 로컬에 저장하지 못했습니다.", error);
@@ -1823,8 +1903,9 @@ async function updateWeatherAt(coordinates, quiet = false) {
     const params = new URLSearchParams({
       latitude: String(coordinates.latitude),
       longitude: String(coordinates.longitude),
-      current: "temperature_2m,precipitation,weather_code",
-      daily: "precipitation_probability_max",
+      current: "temperature_2m,precipitation,weather_code,wind_speed_10m",
+      hourly: "precipitation_probability",
+      wind_speed_unit: "kmh",
       timezone: "auto"
     });
     const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { cache: "no-store" });
@@ -1833,13 +1914,31 @@ async function updateWeatherAt(coordinates, quiet = false) {
     if (!Number.isFinite(data.current?.temperature_2m) || !Number.isFinite(data.current?.weather_code)) {
       throw new Error("날씨 응답 데이터 형식이 올바르지 않습니다.");
     }
+    if (typeof data.current?.time !== "string"
+      || !Array.isArray(data.hourly?.time)
+      || !Array.isArray(data.hourly?.precipitation_probability)
+      || data.hourly.time.length !== data.hourly.precipitation_probability.length) {
+      throw new Error("시간별 강수 예보 데이터 형식이 올바르지 않습니다.");
+    }
+    const currentTime = data.current.time;
+    const currentDate = currentTime.slice(0, 10);
+    const remainingRainProbability = data.hourly.time.reduce((maximum, forecastTime, index) => {
+      const probability = data.hourly.precipitation_probability[index];
+      if (forecastTime < currentTime || !forecastTime.startsWith(currentDate) || !Number.isFinite(probability)) return maximum;
+      return Math.max(maximum, probability);
+    }, 0);
     const codes = { 0: "맑음", 1: "대체로 맑음", 2: "구름 조금", 3: "흐림", 45: "안개", 48: "안개", 51: "이슬비", 53: "이슬비", 55: "비", 61: "비", 63: "비", 65: "강한 비", 71: "눈", 73: "눈", 75: "강한 눈", 80: "소나기", 81: "소나기", 82: "강한 소나기" };
     const updatedAt = new Date().toISOString();
     state.weather = {
       temp: data.current.temperature_2m,
       code: data.current.weather_code,
       description: codes[data.current.weather_code] || "날씨 확인",
-      rain: data.daily?.precipitation_probability_max?.[0] ?? 0,
+      rain: remainingRainProbability,
+      rainForecastDate: currentDate,
+      rainForecastSource: "hourly_remaining_day",
+      timezone: data.timezone,
+      precipitation: Number.isFinite(data.current.precipitation) ? data.current.precipitation : 0,
+      windSpeed: Number.isFinite(data.current.wind_speed_10m) ? data.current.wind_speed_10m : null,
       location: "내 위치",
       updatedAt
     };
